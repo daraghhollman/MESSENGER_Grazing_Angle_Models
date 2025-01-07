@@ -4,16 +4,20 @@ In this script, we look at the distribution of grazing angles as would've been o
 """
 
 import datetime as dt
+import multiprocessing
+from typing import Iterable
 import numpy as np
 import shapely
 import shapely.plotting
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from hermpy import trajectory, utils
 
 
 def main():
 
-    time_steps, positions = Get_Times_And_Positions(resolution=3600)
+    # This could be potentially vectorised, allowing for a roll operation on the regions to find crossings.
+    time_steps, positions = Get_Times_And_Positions(resolution=600)
 
     # We define the boundaries as polygons (closing them at the end)
     magnetopause_points = Get_Magnetopause()
@@ -22,19 +26,58 @@ def main():
     bow_shock_points = Get_Bow_Shock()
     bow_shock_region = shapely.Polygon(bow_shock_points)
 
-    # Now we iterrate through the positions and determine which region the spacecraft is in.
-    # If the point is in neither of the regions, we are in the solar wind.
-    # If the point is in the bow shock region but not the magnetopause region, we are in the magnetosheath.
-    # if the point is in both the bow shock region and the magnetopause region, we are in the magnetosphere.
+    # We then check for the entire trajectory what region the spacecraft is in.
+    print("Finding where points lie")
+    regions = Check_Region_Vectorised(positions, bow_shock_region, magnetopause_region)
+
+    # Now we iterrate through the regions and find the indices when the region changes
     # When the region changes, we mark a crossing and determine the grazing angle.
-    for position in positions:
+    bow_shock_crossing_indices = []
+    magnetopause_crossing_indices = []
 
-        region = Check_Region(position, bow_shock_region, magnetopause_region)
+    previous_region = regions[0]
+    for i, current_region in tqdm(
+        enumerate(regions[1:], start=1),
+        desc="Searching for crossings",
+        total=len(regions) - 1,
+    ):
 
-        print(region)
+        if previous_region != current_region:
+            # Found a crossing
+            if (
+                previous_region == "solar wind" and current_region == "magnetosheath"
+            ) or (
+                previous_region == "magnetosheath" and current_region == "solar wind"
+            ):
+                bow_shock_crossing_indices.append(i)
+            else:
+                magnetopause_crossing_indices.append(i)
+
+        previous_region = current_region
+
+    bow_shock_crossings = {
+        "times": time_steps[bow_shock_crossing_indices],
+        "positions": positions[bow_shock_crossing_indices],
+    }
+    magnetopause_crossings = {
+        "times": time_steps[magnetopause_crossing_indices],
+        "positions": positions[magnetopause_crossing_indices],
+    }
+
+    plt.scatter(
+        bow_shock_crossings["positions"][:, 0],
+        np.sqrt(
+            bow_shock_crossings["positions"][:, 1] ** 2
+            + bow_shock_crossings["positions"][:, 2] ** 2
+        ),
+    )
+
+    plt.show()
 
 
-def Get_Times_And_Positions(resolution: int = 600):
+def Get_Times_And_Positions(
+    resolution: int = 600, cpus: int = multiprocessing.cpu_count() - 1
+):
     # Define the start and end time, along with a resolution
     mission_start = dt.datetime(2011, 3, 23, 15, 37)
     mission_end = dt.datetime(2015, 4, 30, 15, 8)
@@ -48,16 +91,33 @@ def Get_Times_And_Positions(resolution: int = 600):
         ]
     )
 
+    time_chunks = np.array_split(time_steps, cpus)
+
     print("Time steps calculated")
 
-    positions = trajectory.Get_Position(
-        "MESSENGER", time_steps, frame="MSM", aberrate=False
-    )
-    positions /= utils.Constants.MERCURY_RADIUS_KM
+    with multiprocessing.Pool(cpus) as pool:
+        results = list(
+            tqdm(
+                pool.map(Compute_Chunk_Positions, time_chunks),
+                desc="Finding positions",
+                total=len(time_chunks),
+            )
+        )
+
+    positions = np.concatenate(results)
 
     print("Found positions")
 
     return time_steps, positions
+
+
+def Compute_Chunk_Positions(time_chunk: Iterable[dt.datetime]):
+    positions = trajectory.Get_Position(
+        "MESSENGER", time_chunk, frame="MSM", aberrate=False
+    )
+    positions /= utils.Constants.MERCURY_RADIUS_KM
+
+    return positions
 
 
 def Check_Region(position, bow_shock_region, magnetopause_region):
@@ -94,6 +154,45 @@ def Check_Region(position, bow_shock_region, magnetopause_region):
         raise ValueError(f"Can't determine spacecraft region for position {position}")
 
     return region
+
+
+def Check_Region_Vectorised(positions, bow_shock_region, magnetopause_region):
+
+    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
+
+    xy_points = [shapely.Point(xy) for xy in zip(x, y)]
+    xz_points = [shapely.Point(xz) for xz in zip(x, z)]
+
+    regions = []
+    for xy, xz in tqdm(zip(xy_points, xz_points), desc="Determining spacecraft region", total=len(positions)):
+        if xy.within(bow_shock_region) and xz.within(bow_shock_region):
+            within_bow_shock = True
+
+        else:
+            within_bow_shock = False
+
+        if xy.within(magnetopause_region) and xz.within(magnetopause_region):
+            within_magnetopause = True
+
+        else:
+            within_magnetopause = False
+
+        if within_bow_shock and within_magnetopause:
+            region = "magnetosphere"
+
+        elif within_bow_shock and not within_magnetopause:
+            region = "magnetosheath"
+
+        elif not within_bow_shock and not within_magnetopause:
+            region = "solar wind"
+
+        else:
+            raise ValueError(f"Can't determine spacecraft region for position {position}")
+
+        regions.append(region)
+
+    return regions
+
 
 
 def Get_Magnetopause():
