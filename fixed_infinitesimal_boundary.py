@@ -1,23 +1,28 @@
 """
 In this script, we look at the distribution of grazing angles as would've been observed for crossings only occuring along the Winslow+ 2013 boundary models.
 
+The average aberrated frame is used for computational speed.
 """
 
 import datetime as dt
 import multiprocessing
 from typing import Iterable
 import numpy as np
+import pandas as pd
 import shapely
 import shapely.plotting
+import shapely.vectorized
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from hermpy import trajectory, utils
+from hermpy import trajectory, utils, plotting
 
 
 def main():
+    plot = False
+    resolution = 600 # seconds
 
     # This could be potentially vectorised, allowing for a roll operation on the regions to find crossings.
-    time_steps, positions = Get_Times_And_Positions(resolution=600)
+    time_steps, positions = Get_Times_And_Positions(resolution=resolution)
 
     # We define the boundaries as polygons (closing them at the end)
     magnetopause_points = Get_Magnetopause()
@@ -32,8 +37,8 @@ def main():
 
     # Now we iterrate through the regions and find the indices when the region changes
     # When the region changes, we mark a crossing and determine the grazing angle.
-    bow_shock_crossing_indices = []
-    magnetopause_crossing_indices = []
+    bow_shock_crossing_times = []
+    magnetopause_crossing_times = []
 
     previous_region = regions[0]
     for i, current_region in tqdm(
@@ -49,38 +54,111 @@ def main():
             ) or (
                 previous_region == "magnetosheath" and current_region == "solar wind"
             ):
-                bow_shock_crossing_indices.append(i)
+                bow_shock_crossing_times.append(
+                    time_steps[i - 1] + (time_steps[i] - time_steps[i - 1]) / 2
+                )
             else:
-                magnetopause_crossing_indices.append(i)
+                magnetopause_crossing_times.append(
+                    time_steps[i - 1] + (time_steps[i] - time_steps[i - 1]) / 2
+                )
 
         previous_region = current_region
 
-    bow_shock_crossings = {
-        "times": time_steps[bow_shock_crossing_indices],
-        "positions": positions[bow_shock_crossing_indices],
-    }
-    magnetopause_crossings = {
-        "times": time_steps[magnetopause_crossing_indices],
-        "positions": positions[magnetopause_crossing_indices],
-    }
-
-    plt.scatter(
-        bow_shock_crossings["positions"][:, 0],
-        np.sqrt(
-            bow_shock_crossings["positions"][:, 1] ** 2
-            + bow_shock_crossings["positions"][:, 2] ** 2
-        ),
+    # We must define the crossings in the same way as we would for a crossing list.
+    # This is so that we can use our grazing angle code.
+    bow_shock_positions = (
+        trajectory.Get_Avg_Aberrated_Position("MESSENGER", bow_shock_crossing_times)
+        / utils.Constants.MERCURY_RADIUS_KM
+    )
+    magnetopause_positions = (
+        trajectory.Get_Avg_Aberrated_Position("MESSENGER", magnetopause_crossing_times)
+        / utils.Constants.MERCURY_RADIUS_KM
     )
 
-    plt.show()
+    bow_shock_crossings = {
+        "Start Time": bow_shock_crossing_times,
+        "End Time": bow_shock_crossing_times,
+        "X MSM'": bow_shock_positions[:, 0],
+        "Y MSM'": bow_shock_positions[:, 1],
+        "Z MSM'": bow_shock_positions[:, 2],
+    }
+    magnetopause_crossings = {
+        "Start Time": magnetopause_crossing_times,
+        "End Time": magnetopause_crossing_times,
+        "X MSM'": magnetopause_positions[:, 0],
+        "Y MSM'": magnetopause_positions[:, 1],
+        "Z MSM'": magnetopause_positions[:, 2],
+    }
+
+    if plot:
+        for crossings in [bow_shock_crossings, magnetopause_crossings]:
+            fig, ax = plt.subplots()
+
+            ax.scatter(
+                crossings["positions"][:, 0],
+                np.sqrt(
+                    crossings["positions"][:, 1] ** 2
+                    + crossings["positions"][:, 2] ** 2
+                ),
+                alpha=0.1,
+                color="indianred",
+            )
+
+            plotting.Plot_Magnetospheric_Boundaries(ax)
+            plotting.Format_Cylindrical_Plot(ax)
+
+            plt.show()
+
+            fig, ax = plt.subplots()
+            ax.scatter(
+                crossings["positions"][:, 0],
+                crossings["positions"][:, 1],
+                alpha=0.1,
+                color="indianred",
+            )
+            plotting.Plot_Magnetospheric_Boundaries(ax)
+            plotting.Plot_Mercury(ax, shaded_hemisphere="left", frame="MSM", plane="xy")
+            plotting.Square_Axes(ax, 6)
+            plotting.Add_Labels(ax, plane="xy", frame="MSM")
+
+            plt.show()
+
+            fig, ax = plt.subplots()
+            ax.scatter(
+                crossings["positions"][:, 0],
+                crossings["positions"][:, 2],
+                alpha=0.1,
+                color="indianred",
+            )
+            plotting.Plot_Magnetospheric_Boundaries(ax)
+            plotting.Plot_Mercury(ax, shaded_hemisphere="left", frame="MSM", plane="xz")
+            plotting.Square_Axes(ax, 6)
+            plotting.Add_Labels(ax, plane="xz", frame="MSM")
+
+            plt.show()
+
+    # We then need to calculate grazing angles for each crossing
+    bow_shock_crossings = pd.DataFrame(bow_shock_crossings)
+    magnetopause_crossings = pd.DataFrame(magnetopause_crossings)
+
+    grazing_angles = trajectory.Get_Grazing_Angle(bow_shock_crossings, function="bow shock", aberrate="average")
+
+    print(grazing_angles)
+
+
+
+def Get_Grazing_Angles(input):
+    crossing, function = input
+    return trajectory.Get_Grazing_Angle(crossing, function=function, aberrate="average")
 
 
 def Get_Times_And_Positions(
-    resolution: int = 600, cpus: int = multiprocessing.cpu_count() - 1
+    resolution: int = 600,
+    cpus: int = multiprocessing.cpu_count() - 1,
 ):
     # Define the start and end time, along with a resolution
     mission_start = dt.datetime(2011, 3, 23, 15, 37)
-    mission_end = dt.datetime(2015, 4, 30, 15, 8)
+    mission_end = dt.datetime(2012, 4, 30, 15, 8)
 
     mission_duration = int((mission_end - mission_start).total_seconds())
 
@@ -98,7 +176,7 @@ def Get_Times_And_Positions(
     with multiprocessing.Pool(cpus) as pool:
         results = list(
             tqdm(
-                pool.map(Compute_Chunk_Positions, time_chunks),
+                pool.imap(Compute_Chunk_Positions, time_chunks),
                 desc="Finding positions",
                 total=len(time_chunks),
             )
@@ -111,88 +189,32 @@ def Get_Times_And_Positions(
     return time_steps, positions
 
 
-def Compute_Chunk_Positions(time_chunk: Iterable[dt.datetime]):
-    positions = trajectory.Get_Position(
-        "MESSENGER", time_chunk, frame="MSM", aberrate=False
-    )
+def Compute_Chunk_Positions(time_chunk):
+
+    positions = trajectory.Get_Avg_Aberrated_Position("MESSENGER", time_chunk)
     positions /= utils.Constants.MERCURY_RADIUS_KM
 
     return positions
 
 
-def Check_Region(position, bow_shock_region, magnetopause_region):
-    x, y, z = position
-
-    # First check if within bow shock
-    if bow_shock_region.contains(shapely.Point(x, y)) and bow_shock_region.contains(
-        shapely.Point(x, z)
-    ):
-        within_bow_shock = True
-    else:
-        within_bow_shock = False
-
-    # The check if within magnetopause
-    if magnetopause_region.contains(
-        shapely.Point(x, y)
-    ) and magnetopause_region.contains(shapely.Point(x, z)):
-        within_magnetopause = True
-    else:
-        within_magnetopause = False
-
-    # Finally, confirm which region we are in
-
-    if within_bow_shock and within_magnetopause:
-        region = "magnetosphere"
-
-    elif within_bow_shock and not within_magnetopause:
-        region = "magnetosheath"
-
-    elif not within_bow_shock and not within_magnetopause:
-        region = "solar wind"
-
-    else:
-        raise ValueError(f"Can't determine spacecraft region for position {position}")
-
-    return region
-
-
 def Check_Region_Vectorised(positions, bow_shock_region, magnetopause_region):
 
-    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
+    x, yz = positions[:, 0], np.sqrt(positions[:, 1] ** 2 + positions[:, 2] ** 2)
 
-    xy_points = [shapely.Point(xy) for xy in zip(x, y)]
-    xz_points = [shapely.Point(xz) for xz in zip(x, z)]
+    within_bow_shock = shapely.vectorized.contains(bow_shock_region, x, yz)
 
-    regions = []
-    for xy, xz in tqdm(zip(xy_points, xz_points), desc="Determining spacecraft region", total=len(positions)):
-        if xy.within(bow_shock_region) and xz.within(bow_shock_region):
-            within_bow_shock = True
+    within_magnetopause = shapely.vectorized.contains(magnetopause_region, x, yz)
 
-        else:
-            within_bow_shock = False
+    regions = np.full(len(positions), "unknown", dtype=object)
 
-        if xy.within(magnetopause_region) and xz.within(magnetopause_region):
-            within_magnetopause = True
+    regions[within_bow_shock & within_magnetopause] = "magnetosphere"
+    regions[within_bow_shock & ~within_magnetopause] = "magnetosheath"
+    regions[~within_bow_shock & ~within_magnetopause] = "solar wind"
 
-        else:
-            within_magnetopause = False
-
-        if within_bow_shock and within_magnetopause:
-            region = "magnetosphere"
-
-        elif within_bow_shock and not within_magnetopause:
-            region = "magnetosheath"
-
-        elif not within_bow_shock and not within_magnetopause:
-            region = "solar wind"
-
-        else:
-            raise ValueError(f"Can't determine spacecraft region for position {position}")
-
-        regions.append(region)
+    if np.any(regions == "unknown"):
+        raise ValueError("Can't determine spacecraft region")
 
     return regions
-
 
 
 def Get_Magnetopause():
